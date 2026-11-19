@@ -1,149 +1,94 @@
 #!/usr/bin/env bash
-# tx6rec recorder: captures all 12 TX-6 USB channels, then splits them into
-# one stereo WAV per TX-6 input. Runs outside matron; the mod only starts it,
-# stops it and reads the files in <state>.
+# tx6rec split: turns a raw 12-channel take into one file per TX-6 input,
+# following the input modes in <state>/settings (read now, so changes made
+# during a take apply).
 #
-#   rec.sh start   <state> <takes>   record until `stop`, then split
-#   rec.sh stop    <state>           stop recording (data is kept)
-#   rec.sh recover <state> <takes>   split takes left over from a crash/power cut
+#   rec.sh split   <raw> <state> <shm> [reason]   called by tx6d.py after a take
+#   rec.sh recover <state> <shm> <takes>          split raws left by a crash
 #
-# Capture itself is lib/capture.py. A take is captured as raw interleaved PCM (no 4 GB WAV limit, and nothing
-# to finalize if the power goes). TX-6 input n = USB channels 2n-1 and 2n.
+# Raw takes are interleaved S24_3LE, 48 kHz, 12 channels; TX-6 input n is on
+# channels 2n-1 (left) and 2n (right). Progress goes to <shm>/split.
+#
+# Modes: stereo -> <base>_inN.wav, mono -> <base>_inN.wav (left channel, where
+# the TX-6 puts a mono cable), 2x mono -> <base>_inNL.wav + <base>_inNR.wav,
+# off -> nothing. With skip=1, channels that are pure digital silence are skipped.
 
 set -u
-RATE=48000
-CH=12
-BPS=$((CH * 3 * RATE))              # raw bytes per second (1.73 MB/s)
-RESERVE=$((256 * 1024 * 1024))      # always leave this much disk free
-SOXIN=(-t raw -r "$RATE" -e signed -b 24 -c "$CH" -L)
-
+SOXIN=(-t raw -r 48000 -e signed -b 24 -c 12 -L)
 cmd=${1:-}
-state=${2:?state dir}
-takes=${3:-}
-mkdir -p "$state"
 
+S_STATE=done S_PROG= S_MSG= S_TAKE=
+write_split() {
+  printf 'state=%s\ntake=%s\nprog=%s\nmsg=%s\nt=%s\n' \
+    "$S_STATE" "$S_TAKE" "$S_PROG" "$S_MSG" "$(date +%s)" > "$shm/split.tmp"
+  mv -f "$shm/split.tmp" "$shm/split"
+}
 log() { echo "$(date '+%F %T') $*" >> "$state/log"; }
+setting() { sed -n "s/^$1=//p" "$state/settings" 2>/dev/null | head -1; }
 
-# status file, rewritten atomically; only the main recorder process writes it
-S_STATE=idle S_TAKE= S_START=0 S_GLITCH=0 S_MSG= S_PROG=
-write_status() {
-  printf 'state=%s\ntake=%s\nstart=%s\nglitches=%s\nmsg=%s\nprog=%s\n' \
-    "$S_STATE" "$S_TAKE" "$S_START" "$S_GLITCH" "$S_MSG" "$S_PROG" > "$state/status.tmp"
-  mv -f "$state/status.tmp" "$state/status"
-}
-
-# a pid file can outlive its process (matron restart kills us), so check the cmdline too
-running() {
-  local p; p=$(cat "$state/pid" 2>/dev/null) || return 1
-  [ -n "$p" ] && grep -q rec.sh "/proc/$p/cmdline" 2>/dev/null
-}
-
-# split one raw take into <take>_inN.wav, skipping inputs that are digital silence
 split_take() {
-  local raw=$1 dir take n k=0 total=0 ok=1 peaks active=()
-  dir=$(dirname "$raw"); take=$(basename "$raw" .raw)
+  local raw=$1 dir base peaks jobs=() job n m a b k=0 ok=1 silent
+  dir=$(dirname "$raw"); base=$(basename "$raw" .raw); S_TAKE=$base
   if [ ! -s "$raw" ]; then
-    rm -f "$raw"; rmdir "$dir" 2>/dev/null
-    S_MSG="nothing recorded"; return
+    rm -f "$raw"; rmdir "$dir" 2>/dev/null; S_MSG="nothing recorded"; return
   fi
-  S_STATE=processing S_PROG="checking inputs"; write_status
-  # one pass for all channel peaks: "Pk lev dB <overall> <ch1> ... <ch12>"
+  S_STATE=processing S_PROG="checking"; write_split
+  # one pass for every channel's peak: "Pk lev dB <overall> <ch1> ... <ch12>"
   peaks=($(nice -n 19 ionice -c3 sox "${SOXIN[@]}" "$raw" -n stats 2>&1 \
     | awk '/^Pk lev dB/ { for (i = 5; i <= NF; i++) printf "%s ", $i }'))
-  if [ ${#peaks[@]} -ne $CH ]; then
-    log "split: could not read levels of $raw"; S_MSG="error reading take"; return
+  if [ ${#peaks[@]} -ne 12 ]; then
+    log "split: could not read levels of $raw"; S_MSG="error, raw kept"; return
   fi
+  local skip; skip=$(setting skip); skip=${skip:-1}
+  silent() { [ "$skip" = 1 ] && [ "${peaks[$(($1 - 1))]}" = "-inf" ]; }
   for n in 1 2 3 4 5 6; do
-    if [ "${peaks[$((2*n-2))]}" != "-inf" ] || [ "${peaks[$((2*n-1))]}" != "-inf" ]; then
-      active+=("$n")
-    fi
+    m=$(setting "mode$n"); m=${m:-stereo}
+    a=$((2 * n - 1)); b=$((2 * n))
+    case "$m" in
+      stereo) silent $a && silent $b || jobs+=("$a $b in$n") ;;
+      mono)   silent $a || jobs+=("$a in$n") ;;
+      2xmono) silent $a || jobs+=("$a in${n}L"); silent $b || jobs+=("$b in${n}R") ;;
+    esac
   done
-  total=${#active[@]}
-  for n in "${active[@]}"; do
-    k=$((k + 1)); S_PROG="saving input $n ($k/$total)"; write_status
-    if ! nice -n 19 ionice -c3 sox "${SOXIN[@]}" "$raw" "$dir/${take}_in$n.wav" \
-         remix $((2*n-1)) $((2*n)) 2>>"$state/log"; then
-      ok=0; log "split: input $n of $take failed"
+  for job in "${jobs[@]}"; do
+    k=$((k + 1)); S_PROG="$k/${#jobs[@]}"; write_split
+    local chans=${job% *} name=${job##* }
+    # shellcheck disable=SC2086
+    if ! nice -n 19 ionice -c3 sox "${SOXIN[@]}" "$raw" "$dir/${base}_$name.wav" \
+         remix $chans 2>>"$state/log"; then
+      ok=0; log "split: $name of $base failed"
     fi
   done
   if [ $ok -eq 1 ]; then
-    rm -f "$raw"
-    [ "$total" -eq 0 ] && rmdir "$dir" 2>/dev/null
-    if [ "$total" -eq 0 ]; then S_MSG="all inputs silent"
-    elif [ "$total" -eq 1 ]; then S_MSG="saved 1 track"
-    else S_MSG="saved $total tracks"; fi
-    log "split: $take -> $total tracks"
+    rm -f "$raw"; rmdir "$dir" 2>/dev/null
+    case ${#jobs[@]} in
+      0) S_MSG="all inputs silent" ;;
+      1) S_MSG="saved 1 track" ;;
+      *) S_MSG="saved ${#jobs[@]} tracks" ;;
+    esac
+    log "split: $base -> ${#jobs[@]} tracks"
   else
-    S_MSG="error saving, raw kept"
+    S_MSG="error, raw kept"
   fi
-}
-
-# disk + size watcher; writes <state>/disk and stops the take when space runs low
-monitor() {
-  local raw=$1 free bytes
-  while sleep 2; do
-    kill -0 $$ 2>/dev/null || exit 0   # $$ is the recorder, even in this subshell
-    bytes=$(stat -c %s "$raw" 2>/dev/null || echo 0)
-    free=$(df -B1 --output=avail "$(dirname "$raw")" | tail -1 | tr -d ' ')
-    printf 'free=%s\nbytes=%s\n' "$free" "$bytes" > "$state/disk.tmp"
-    mv -f "$state/disk.tmp" "$state/disk"
-    # the split needs up to one more raw-sized chunk of space
-    if [ "$free" -lt $((bytes + RESERVE)) ]; then
-      echo "disk full" > "$state/reason"
-      touch "$state/stop"
-    fi
-  done
 }
 
 case "$cmd" in
-start)
-  if running; then echo "already running"; exit 1; fi
-  echo $$ > "$state/pid"
-  rm -f "$state/stop" "$state/reason" "$state/disk"
-  S_TAKE=$(date +%Y-%m-%d_%H%M%S)
-  dir="$takes/$S_TAKE"; raw="$dir/$S_TAKE.raw"
-  mkdir -p "$dir"; : > "$raw"
-  S_STATE=recording S_START=$(date +%s); write_status
-  log "start $S_TAKE"
-  rm -f "$state/capture"
-  monitor "$raw" & mon=$!
-  # capture.py restarts stalled streams and buffers SD write pauses in RAM
-  python3 "$(dirname "$0")/capture.py" "$raw" "$state"
-  kill $mon 2>/dev/null
-  rm -f "$state/stop"
-  S_GLITCH=$(sed -n 's/^glitches=//p' "$state/capture" 2>/dev/null); S_GLITCH=${S_GLITCH:-0}
-  reason=$(cat "$state/reason" 2>/dev/null); rm -f "$state/reason"
-  log "stop $S_TAKE${reason:+ ($reason)}"
+split)
+  raw=${2:?raw}; state=${3:?state}; shm=${4:?shm}; reason=${5:-}
+  mkdir -p "$shm"
   split_take "$raw"
   [ -n "$reason" ] && S_MSG="$reason, $S_MSG"
-  S_STATE=idle S_PROG=; write_status
-  rm -f "$state/pid"
-  ;;
-stop)
-  # capture.py polls for this file every 50 ms
-  running && touch "$state/stop"
+  S_STATE=done S_PROG=; write_split
   ;;
 recover)
-  running && exit 0
-  [ -n "$takes" ] || exit 1
-  mkdir -p "$takes"
+  state=${2:?state}; shm=${3:?shm}; takes=${4:?takes}
+  mkdir -p "$shm" "$takes"
   shopt -s nullglob
   left=("$takes"/*/*.raw)
-  echo $$ > "$state/pid"
-  if [ ${#left[@]} -eq 0 ]; then
-    # nothing to split, but clear a status a killed recorder left behind
-    if grep -qE '^state=(recording|processing)' "$state/status" 2>/dev/null; then
-      S_MSG="interrupted"; write_status
-    fi
-    rm -f "$state/pid"; exit 0
-  fi
-  for raw in "${left[@]}"; do
-    S_TAKE=$(basename "$raw" .raw); log "recover $S_TAKE"
-    split_take "$raw"
-  done
-  S_STATE=idle S_PROG= S_MSG="recovered: $S_MSG"; write_status
-  rm -f "$state/pid"
+  [ ${#left[@]} -eq 0 ] && exit 0
+  for raw in "${left[@]}"; do log "recover $raw"; split_take "$raw"; done
+  S_STATE=done S_PROG= S_MSG="recovered: $S_MSG"; write_split
   ;;
 *)
-  echo "usage: rec.sh start|stop|recover <state> [takes]"; exit 1 ;;
+  echo "usage: rec.sh split <raw> <state> <shm> [reason] | recover <state> <shm> <takes>"; exit 1 ;;
 esac
