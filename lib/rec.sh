@@ -7,14 +7,12 @@
 #   rec.sh stop    <state>           stop recording (data is kept)
 #   rec.sh recover <state> <takes>   split takes left over from a crash/power cut
 #
-# A take is captured as raw interleaved PCM (no 4 GB WAV limit, and nothing
+# Capture itself is lib/capture.py. A take is captured as raw interleaved PCM (no 4 GB WAV limit, and nothing
 # to finalize if the power goes). TX-6 input n = USB channels 2n-1 and 2n.
 
 set -u
-CARD=hw:TX6
 RATE=48000
 CH=12
-FMT=S24_3LE
 BPS=$((CH * 3 * RATE))              # raw bytes per second (1.73 MB/s)
 RESERVE=$((256 * 1024 * 1024))      # always leave this much disk free
 SOXIN=(-t raw -r "$RATE" -e signed -b 24 -c "$CH" -L)
@@ -93,7 +91,6 @@ monitor() {
     if [ "$free" -lt $((bytes + RESERVE)) ]; then
       echo "disk full" > "$state/reason"
       touch "$state/stop"
-      pkill -INT -f "arecord -q -D $CARD" 2>/dev/null
     fi
   done
 }
@@ -108,24 +105,13 @@ start)
   mkdir -p "$dir"; : > "$raw"
   S_STATE=recording S_START=$(date +%s); write_status
   log "start $S_TAKE"
+  rm -f "$state/capture"
   monitor "$raw" & mon=$!
-  fails=0
-  while [ ! -e "$state/stop" ]; do
-    t0=$(date +%s)
-    arecord -q -D "$CARD" -c "$CH" -f "$FMT" -r "$RATE" -t raw >> "$raw" 2>>"$state/log" &
-    echo $! > "$state/arecord.pid"
-    wait $!
-    rc=$?
-    [ -e "$state/stop" ] && break
-    # arecord died on its own (I/O error, unplugged): keep appending to the take
-    S_GLITCH=$((S_GLITCH + 1)); log "arecord exited ($rc), restarting"
-    if [ $(($(date +%s) - t0)) -lt 2 ]; then fails=$((fails + 1)); else fails=0; fi
-    if [ $fails -ge 5 ]; then echo "TX-6 lost" > "$state/reason"; break; fi
-    write_status
-    sleep 0.3
-  done
+  # capture.py restarts stalled streams and buffers SD write pauses in RAM
+  python3 "$(dirname "$0")/capture.py" "$raw" "$state"
   kill $mon 2>/dev/null
-  rm -f "$state/arecord.pid" "$state/stop"
+  rm -f "$state/stop"
+  S_GLITCH=$(sed -n 's/^glitches=//p' "$state/capture" 2>/dev/null); S_GLITCH=${S_GLITCH:-0}
   reason=$(cat "$state/reason" 2>/dev/null); rm -f "$state/reason"
   log "stop $S_TAKE${reason:+ ($reason)}"
   split_take "$raw"
@@ -134,14 +120,8 @@ start)
   rm -f "$state/pid"
   ;;
 stop)
-  touch "$state/stop"
-  # arecord may be (re)starting right now, so keep signalling until it is gone
-  for _ in $(seq 25); do
-    p=$(cat "$state/arecord.pid" 2>/dev/null)
-    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then kill -INT "$p"
-    elif ! running || grep -q '^state=processing' "$state/status" 2>/dev/null; then break; fi
-    sleep 0.2
-  done
+  # capture.py polls for this file every 50 ms
+  running && touch "$state/stop"
   ;;
 recover)
   running && exit 0

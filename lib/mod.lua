@@ -15,6 +15,7 @@ local BPS = 12 * 3 * 48000 -- raw bytes per second of a take
 
 local status = {} -- STATE/status, written by rec.sh
 local disk = {}   -- STATE/disk, written by rec.sh while recording
+local cap = {}    -- STATE/capture, written by capture.py while recording
 local idle_free   -- free bytes when not recording (from df)
 local present = false
 local pending     -- "start"/"stop" pressed, waiting for rec.sh to react
@@ -71,6 +72,7 @@ end
 local function update()
   status = read_kv(STATE .. "status")
   disk = read_kv(STATE .. "disk")
+  cap = read_kv(STATE .. "capture")
   present = tx6_present()
   if (status.state == "recording" or status.state == "processing") and not alive()
     and not pending then
@@ -169,8 +171,13 @@ m.redraw = function()
   if st == "processing" then
     screen.text(status.prog or "")
   elseif st == "recording" then
-    local g = tonumber(status.glitches) or 0
-    if g > 0 then screen.text(g .. (g == 1 and " dropout" or " dropouts")) end
+    local g = tonumber(cap.glitches) or 0
+    local buffered = tonumber(cap.buffered) or 0
+    local line = {}
+    if g > 0 then line[#line + 1] = g .. (g == 1 and " dropout" or " dropouts") end
+    -- the SD card is behind; harmless unless it keeps growing
+    if buffered > 50e6 then line[#line + 1] = gb(buffered) .. " in RAM" end
+    screen.text(table.concat(line, ", "))
   elseif status.msg and status.msg ~= "" then
     screen.text(status.msg)
   end

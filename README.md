@@ -32,9 +32,12 @@ once they're dragged into a DAW. Fetch them over SMB/SFTP like any other norns a
   ship with norns).
 - Raw PCM has no 4 GB limit and nothing to finalize, so a crash or power cut
   loses nothing: leftover takes are split at the next startup.
-- If the USB stream drops out (the TX-6 occasionally refuses the first read),
-  the recorder restarts within a fraction of a second and appends to the same
-  take; the page counts dropouts. Five failures in a row stop the take.
+- `lib/capture.py` works around three quirks measured on norns + TX-6:
+  about 1 in 4 stream starts stall (it restarts `arecord` after 0.3 s without
+  audio), each start has ~0.2 ms of junk (the first 20 ms are dropped), and the
+  SD card pauses writes for up to 3 s (audio waits in RAM meanwhile). A restart
+  after audio has started is counted as a dropout on the page; ten failed starts
+  in a row stop the take ("TX-6 lost").
 - Splitting runs at the lowest CPU and disk priority, so scripts keep their timing.
 - Disk use is 1.73 MB/s while recording (about 6.2 GB an hour). The page shows
   the time left, with room reserved for the split, and the take stops on its
